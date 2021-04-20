@@ -1,13 +1,14 @@
+use escape8259::unescape;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1},
     character::complete::{digit0, digit1, multispace0, multispace1, one_of},
-    combinator::{map, map_res, opt, recognize, value},
+    combinator::{all_consuming, map, opt, recognize, value},
+    error::{ErrorKind, ParseError},
     multi::{many0, separated_list0},
     sequence::{delimited, pair, separated_pair, tuple},
     IResult,
 };
-use escape8259::unescape;
 
 #[derive(PartialEq, Debug, Clone)]
 pub enum Node {
@@ -17,7 +18,29 @@ pub enum Node {
     Float(f64),
     Str(String),
     Array(Vec<Node>),
-    Object(Vec<(String, Node)>)
+    Object(Vec<(String, Node)>),
+}
+
+#[derive(thiserror::Error, Debug, PartialEq)]
+pub enum JSONParseError {
+    #[error("Bad integer")]
+    BadInt,
+    #[error("Bad float")]
+    BadFloat,
+    #[error("Bad escape sequence")]
+    BadEscape,
+    #[error("Unknown parser error")]
+    Unparseable,
+}
+
+impl<I> ParseError<I> for JSONParseError {
+    fn from_error_kind(_input: I, _kind: ErrorKind) -> Self {
+        JSONParseError::Unparseable
+    }
+
+    fn append(_: I, _: ErrorKind, other: Self) -> Self {
+        other
+    }
 }
 
 // STRING
@@ -27,12 +50,14 @@ fn is_nonescaped_string_char(c: char) -> bool {
     (cv > 0x20) && (cv != 0x22) && (cv != 0x5C)
 }
 
-fn nonescaped_string(input: &str) -> IResult<&str, &str> {
-    take_while1(is_nonescaped_string_char)
+fn nonescaped_string(input: &str) -> IResult<&str, &str, JSONParseError> {
+    take_while1(
+        is_nonescaped_string_char
+    )
     (input)
 }
 
-fn escape_code(input: &str) -> IResult<&str, &str> {
+fn escape_code(input: &str) -> IResult<&str, &str, JSONParseError> {
     recognize(
         pair(
             tag("\\"),
@@ -52,12 +77,12 @@ fn escape_code(input: &str) -> IResult<&str, &str> {
     (input)
 }
 
-fn string_body(input: &str) -> IResult<&str, &str> {
+fn string_body(input: &str) -> IResult<&str, &str, JSONParseError> {
     recognize(
         many0(
             alt((
-                nonescaped_string,
-                escape_code,
+                nonescaped_string, 
+                escape_code, 
                 multispace1
             ))
         )
@@ -65,60 +90,68 @@ fn string_body(input: &str) -> IResult<&str, &str> {
     (input)
 }
 
-fn string_literal(input: &str) -> IResult<&str, String> {
-    let parser = delimited(
+fn string_literal(input: &str) -> IResult<&str, String, JSONParseError> {
+    let (remain, raw_str) = delimited(
         tag("\""), 
-        string_body,
+        string_body, 
         tag("\"")
-    );
-    map_res(parser, |s| {
-        unescape(s)
-    })
-    (input)
+    )
+    (input)?;
+
+    match unescape(raw_str) {
+        Ok(s) => Ok((remain, s)),
+        Err(_) => Err(nom::Err::Failure(JSONParseError::BadEscape))
+    }
 }
 
-fn json_string(input: &str) -> IResult<&str, Node> {
-    map(string_literal, |s| {
+fn json_string(input: &str) -> IResult<&str, Node, JSONParseError> {
+    map(string_literal, |s| 
         Node::Str(s)
-    })
+    )
     (input)
 }
 
 // NUMBER
 
-fn digit1to9(input: &str) -> IResult<&str, char> {
+fn digit1to9(input: &str) -> IResult<&str, char, JSONParseError> {
     one_of("123456789")
     (input)
 }
 
-fn uint(input: &str) -> IResult<&str, &str> {
+fn uint(input: &str) -> IResult<&str, &str, JSONParseError> {
     alt((
         tag("0"), 
         recognize(
-            pair(digit1to9, digit0)
-        ))
-    )
+            pair(
+                digit1to9, 
+                digit0
+            )
+        )
+    ))
     (input)
 }
 
 //FLOAT
 
-fn frac(input: &str) -> IResult<&str, &str> {
+fn frac(input: &str) -> IResult<&str, &str, JSONParseError> {
     recognize(
-        pair(tag("."), digit1)
+        pair(
+            tag("."), 
+            digit1
+        )
     )
     (input)
 }
 
-fn exp(input: &str) -> IResult<&str, &str> {
+fn exp(input: &str) -> IResult<&str, &str, JSONParseError> {
     recognize(
         tuple((
             tag("e"), 
             opt(
                 alt((
                     tag("-"), 
-                    tag("+")
-                ))
+                    tag("+"))
+                )
             ), 
             digit1
         ))
@@ -126,8 +159,8 @@ fn exp(input: &str) -> IResult<&str, &str> {
     (input)
 }
 
-fn json_float(input: &str) -> IResult<&str, Node> {
-    let parser = recognize(
+fn float_body(input: &str) -> IResult<&str, &str, JSONParseError> {
+    recognize(
         tuple((
             opt(tag("-")),
             uint,
@@ -137,102 +170,123 @@ fn json_float(input: &str) -> IResult<&str, Node> {
                     opt(exp)
                 )),
                 exp
-            ))
+            )),
         ))
-    );
-    map(parser, |s| {
-        let n = s.parse::<f64>().unwrap();
-        Node::Float(n)
-    })
+    )
     (input)
+}
+
+fn json_float(input: &str) -> IResult<&str, Node, JSONParseError> {
+    let (remain, raw_float) = float_body(input)?;
+    match raw_float.parse::<f64>() {
+        Ok(f) => Ok((remain, Node::Float(f))),
+        Err(_) => Err(nom::Err::Failure(JSONParseError::BadFloat)),
+    }
 }
 
 // INTEGER
 
-fn json_integer(input: &str) -> IResult<&str, Node> {
-    let parser = recognize(
-        pair(opt(
-            tag("-")
-        ), uint
-    ));
-    map(parser, |s| {
-        let n = s.parse::<i64>().unwrap();
-        Node::Integer(n)
-    })(input)
+fn integer_body(input: &str) -> IResult<&str, &str, JSONParseError> {
+    recognize(
+        pair(
+            opt(tag("-")),
+            uint
+        )
+    )
+    (input)
+}
+
+fn json_integer(input: &str) -> IResult<&str, Node, JSONParseError> {
+    let (remain, raw_int) = integer_body(input)?;
+    match raw_int.parse::<i64>() {
+        Ok(i) => Ok((remain, Node::Integer(i))),
+        Err(_) => Err(nom::Err::Failure(JSONParseError::BadInt))
+    }
 }
 
 //BOOL
 
-fn json_bool(input: &str) -> IResult<&str, Node> {
+fn json_bool(input: &str) -> IResult<&str, Node, JSONParseError> {
     alt((
         value(Node::Bool(false), tag("false")),
         value(Node::Bool(true), tag("true")),
-    ))(input)
+    ))
+    (input)
 }
 
 // NULL
 
-fn json_null(input: &str) -> IResult<&str, Node> {
-    value(Node::Null {}, tag("null"))(input)
+fn json_null(input: &str) -> IResult<&str, Node, JSONParseError> {
+    value(
+        Node::Null {}, 
+        tag("null")
+    )
+    (input)
 }
 
-fn json_value(input: &str) -> IResult<&str, Node> {
+fn json_value(input: &str) -> IResult<&str, Node, JSONParseError> {
     alt((
-        json_string,
-        json_float,
-        json_integer,
-        json_bool,
+        json_string, 
+        json_float, 
+        json_integer, 
+        json_bool, 
         json_null
     ))
     (input)
 }
 
-// ARRAY 
+// ARRAY
 
-fn json_array(input: &str) -> IResult<&str, Node> {
+fn json_array(input: &str) -> IResult<&str, Node, JSONParseError> {
     let parser = delimited(
-        handle_whitespace(tag("[")), 
-        separated_list0(
-            handle_whitespace(tag(",")), 
-            json_value
-        ), 
-        handle_whitespace(tag("]")));
-    map(parser, |s| {
-        Node::Array(s)
-    })
-    (input)
+        handle_whitespace(tag("[")),
+        separated_list0(handle_whitespace(tag(",")), json_value),
+        handle_whitespace(tag("]")),
+    );
+    map(parser, |s| Node::Array(s))(input)
 }
 
 // OBJECT
 
-fn object_member(input: &str) -> IResult<&str, (String, Node)> {
+fn object_member(input: &str) -> IResult<&str, (String, Node), JSONParseError> {
     separated_pair(string_literal, handle_whitespace(tag(":")), json_value)
     (input)
 }
 
-fn json_object(input: &str) -> IResult<&str, Node> {
+fn json_object(input: &str) -> IResult<&str, Node, JSONParseError> {
     let parser = delimited(
-        handle_whitespace(tag("{")), 
+        handle_whitespace(tag("{")),
         separated_list0(
             handle_whitespace(tag(",")), 
             object_member
-        ), 
-        handle_whitespace(tag("}"))
+        ),
+        handle_whitespace(tag("}")),
     );
-    map(parser, |s| {
+    map(parser, |s| 
         Node::Object(s)
-    })
+    )
     (input)
 }
 
-fn handle_whitespace<F, I, O, E>(f: F) -> impl FnMut(I) -> IResult<I, O, E> 
-where 
-    F: Fn(I) -> IResult<I, O, E>, 
+fn handle_whitespace<F, I, O, E>(f: F) -> impl FnMut(I) -> IResult<I, O, E>
+where
+    F: Fn(I) -> IResult<I, O, E>,
     I: nom::InputTakeAtPosition,
     <I as nom::InputTakeAtPosition>::Item: nom::AsChar + Clone,
     E: nom::error::ParseError<I>,
 {
-    delimited(multispace0, f , multispace0)
+    delimited(multispace0, f, multispace0)
+}
+
+pub fn parse_json(input: &str) -> Result<Node, JSONParseError> {
+    let (_, result) = all_consuming(json_value)(input).map_err(|nom_err| {
+        match nom_err {
+            nom::Err::Incomplete(_) => unreachable!(),
+            nom::Err::Error(e) => e,
+            nom::Err::Failure(e) => e,
+        }
+    })?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -317,7 +371,13 @@ mod tests {
         let expected = Node::Object(vec![(String::from("test"), Node::Integer(1))]);
         assert_eq!(json_object(r#"{  "test"  :  1  }"#), Ok(("", expected)));
 
-        let expected = Node::Object(vec![(String::from("int"), Node::Integer(1)), (String::from("str"), Node::Str(String::from("test")))]);
-        assert_eq!(json_object(r#"{  "int": 1, "str": "test"  }"#), Ok(("", expected)));
+        let expected = Node::Object(vec![
+            (String::from("int"), Node::Integer(1)),
+            (String::from("str"), Node::Str(String::from("test"))),
+        ]);
+        assert_eq!(
+            json_object(r#"{  "int": 1, "str": "test"  }"#),
+            Ok(("", expected))
+        );
     }
 }
