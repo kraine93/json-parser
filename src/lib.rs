@@ -224,17 +224,6 @@ fn json_null(input: &str) -> IResult<&str, Node, JSONParseError> {
     (input)
 }
 
-fn json_value(input: &str) -> IResult<&str, Node, JSONParseError> {
-    alt((
-        json_string, 
-        json_float, 
-        json_integer, 
-        json_bool, 
-        json_null
-    ))
-    (input)
-}
-
 // ARRAY
 
 fn json_array(input: &str) -> IResult<&str, Node, JSONParseError> {
@@ -265,6 +254,19 @@ fn json_object(input: &str) -> IResult<&str, Node, JSONParseError> {
     map(parser, |s| 
         Node::Object(s)
     )
+    (input)
+}
+
+fn json_value(input: &str) -> IResult<&str, Node, JSONParseError> {
+    alt((
+        json_string, 
+        json_float, 
+        json_integer, 
+        json_bool, 
+        json_null,
+        json_array,
+        json_object,
+    ))
     (input)
 }
 
@@ -379,5 +381,11 @@ mod tests {
             json_object(r#"{  "int": 1, "str": "test"  }"#),
             Ok(("", expected))
         );
+    }
+
+    #[test]
+    fn test_json() {
+        let expected = Node::Object(vec![(String::from("test"), Node::Integer(1))]);
+        assert_eq!(parse_json(r#"{  "test"  :  1  }"#), Ok(expected));
     }
 }
